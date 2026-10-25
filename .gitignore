@@ -1,0 +1,12 @@
+# queue state (machine-local)
+pending/
+running/
+done/
+logs/
+state.json
+daemon.log
+QUEUE.md
+QUEUE.md.tmp
+PAUSE
+RELOAD
+__pycache__/
