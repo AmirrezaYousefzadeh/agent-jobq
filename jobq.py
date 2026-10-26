@@ -12,8 +12,9 @@ pending job only when
 Jobs run under `nice -n 19 ionice -c3` in jobq.slice (CPU weight 1: other users' work always wins). Each job gets its
 own cgroup with a 50 GB RAM cap (beyond it, swap). Admission overbooks: a running job reserves its real use plus half
 of the rest of its declaration, and a new job needs half of its declaration (+ margin) free. Memory guard (every 5 s):
-free RAM < 5 GB -> the newest CPU job is frozen and pushed to swap; it resumes when RAM frees up. GPU jobs are never
-frozen.
+free RAM < 5 GB -> the fastest-growing job above 20 GB (else the newest CPU job) is frozen and pushed to swap; it
+resumes when RAM frees up. Other jobs start around a frozen job; after 2 h frozen, new starts stop until it resumes.
+GPU jobs are never frozen.
 Optionally (install.sh --exclusive-swap) jobq.slice is the only slice allowed to swap.
 
 Watchdog: leftover processes of a finished job are killed; a running job that holds > 1 GB RAM and used no CPU for
@@ -50,6 +51,8 @@ STALL_RAM_GB = 1.0     # a stalled job is killed only if it holds at least this 
 OVERBOOK = 0.5        # a running job reserves its real RAM use plus this share of the rest of its declaration
 FREEZE_BELOW_GB = 5.0  # free RAM below this: freeze the newest CPU job and push it to swap
 RESUME_ABOVE_GB = 10.0 # a frozen job resumes when free RAM minus its swapped-out memory stays above this
+DRAIN_AFTER_H = 2.0    # other jobs keep starting around a frozen job; after this long frozen, new starts stop until it resumes
+GROWER_GB = 20.0       # a job holding more than this that grew fastest in the last 5 min is frozen first
 STARVE_MIN = 30       # a job waiting this long for RAM/threads stops later jobs from starting ahead of it
 HOG_RAM_GB, HOG_IDLE_MIN = 2.0, 30   # report idle processes outside the queue above this RAM
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL", re.I)
@@ -515,9 +518,19 @@ def scan_hogs(seen: dict) -> list[dict]:
 
 
 def mem_guard(g: dict, log):
-    """Free RAM below FREEZE_BELOW_GB: freeze the newest CPU job and push its memory to swap (HIGH jobs last, GPU jobs never). Free RAM above RESUME_ABOVE_GB: thaw the oldest frozen job."""
+    """Free RAM below FREEZE_BELOW_GB: freeze a CPU job and push its memory to swap: the fastest-growing job holding more
+    than GROWER_GB, else the newest (HIGH jobs last, GPU jobs never). Free RAM above RESUME_ABOVE_GB: thaw the oldest
+    frozen job that fits."""
     t, free = time.time(), mem_available_gb()
     run = jobs(RUNNING)
+    hist = g.setdefault("hist", {})       # job id -> [(time, RAM GB)] over the last 5 min
+    for f, j in run:
+        h = hist.setdefault(f.stem, [])
+        h.append((t, job_usage(j)[0]))
+        while h and t - h[0][0] > 300:
+            h.pop(0)
+    for k in set(hist) - {f.stem for f, _ in run}:
+        del hist[k]
     if free < FREEZE_BELOW_GB:
         if t - g.get("last_freeze", 0) < 20 and free > 2.0:     # give the last freeze time to reach swap
             return
@@ -525,6 +538,10 @@ def mem_guard(g: dict, log):
                  if j.get("cgroup") and not j.get("frozen") and j["gpu"] <= 0]
         cands = sorted([c for c in cands if c[2] >= 0.5], key=lambda c: c[1].get("started") or "", reverse=True)
         cands.sort(key=lambda c: bool(c[1].get("high")))
+        growth = {c[0].stem: c[2] - hist[c[0].stem][0][1] for c in cands if hist.get(c[0].stem)}
+        big = [c for c in cands if c[2] > GROWER_GB and growth.get(c[0].stem, 0) > 0 and not c[1].get("high")]
+        if big:
+            cands = sorted(big, key=lambda c: growth[c[0].stem], reverse=True)
         if not cands:
             if t - g.get("last_warn", 0) > 600:
                 log.write(f"{now()} free RAM {free:.1f} GB but no job can be frozen\n"); g["last_warn"] = t
@@ -544,9 +561,14 @@ def mem_guard(g: dict, log):
         fr = sorted([(f, j) for f, j in run if j.get("frozen")], key=lambda fj: fj[1].get("started") or "")
         if not fr:
             return
-        f, j = fr[0]
         others_active = any(not x.get("frozen") for _, x in run)
-        if free - job_usage(j)[1] < RESUME_ABOVE_GB and others_active:
+        # oldest first, but a frozen job that cannot come back yet must not keep a smaller one frozen
+        for f, j in fr:
+            ram, swap, _ = job_usage(j)
+            back = min(swap, max(0.0, ram_limit(j) - ram))     # what it pages back into RAM (at most up to its cap)
+            if free - back >= RESUME_ABOVE_GB or not others_active:
+                break
+        else:
             return
         try:
             Path(j["cgroup"], "cgroup.freeze").write_text("0")
@@ -610,27 +632,42 @@ def cmd_daemon(a):
                 save(f, j)
                 log.write(f"{now()} killing {j['project']}/{j['name']}: {j['killed']}\n")
                 kill_job(j)
+        # reap exited children nobody waits for (jobs adopted across a RELOAD, background memory.reclaim writers)
+        tracked = {p.pid for p in procs.values()}
+        for d in os.listdir("/proc"):
+            if d.isdigit() and int(d) not in tracked:
+                try:
+                    st = open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()
+                    if st[0] == "Z" and int(st[1]) == os.getpid():
+                        os.waitpid(int(d), os.WNOHANG)
+                except (OSError, IndexError, ValueError):
+                    pass
         running = [j for _, j in jobs(RUNNING)]
         sweep_cgroups({j.get("cgroup") for j in running if j.get("cgroup")})
         threads = sum(j["threads"] for j in running)
         used = [job_usage(j)[0] for j in running]
         free_now = mem_available_gb()
         avail = free_now - OVERBOOK * sum(max(0.0, charge(j) - u) for j, u in zip(running, used) if not j.get("frozen"))
-        frozen = any(j.get("frozen") for j in running)
+        def frozen_h(j):
+            return (time.time() - time.mktime(time.strptime(j["frozen"], "%Y-%m-%d %H:%M:%S"))) / 3600
+        drain = [j for j in running if j.get("frozen") and frozen_h(j) > DRAIN_AFTER_H]
+        any_frozen = any(j.get("frozen") for j in running)
         empty_queue_free = free_now + sum(used)   # RAM free if every queue job ended (the rest belongs to others)
         # anti-starvation: a high-priority job, or one that waited STARVE_MIN for RAM or threads (and would fit in an
         # empty queue), is "urgent"; once an urgent job cannot start, no later job starts ahead of it (no backfill)
         def urgent(j):
             waited = time.time() - time.mktime(time.strptime(j["added"], "%Y-%m-%d %H:%M:%S"))
-            return j.get("high") or (waited > 60 * STARVE_MIN and empty_queue_free >= OVERBOOK * charge(j) + a.margin)
+            # while a job is frozen RAM is already overbooked: a waiting big job must not also hold back the small ones
+            return j.get("high") or (waited > 60 * STARVE_MIN and not any_frozen
+                                     and empty_queue_free >= OVERBOOK * charge(j) + a.margin)
         waiting, blocker = {}, None
         paused = (Q / "PAUSE").exists()
         for f, j in sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), not urgent(fj[1]), fj[0].name)):
             why = None
             if paused:
                 why = "PAUSE file"
-            elif frozen:
-                why = "a frozen job to resume"
+            elif drain:
+                why = f"{drain[0]['project']}/{drain[0]['name']} (frozen > {DRAIN_AFTER_H:g} h, machine draining for it)"
             elif blocker:
                 why = f"{blocker} (waiting longer)"
             elif threads + j["threads"] > budget and threads > 0:
