@@ -12,7 +12,8 @@ pending job only when
 Jobs run under `nice -n 19 ionice -c3` in jobq.slice (CPU weight 1: other users' work always wins). Each job gets its
 own cgroup with a 50 GB RAM cap (beyond it, swap). Admission overbooks: a running job reserves its real use plus half
 of the rest of its declaration, and a new job needs half of its declaration (+ margin) free. Memory guard (every 5 s):
-free RAM < 5 GB -> the fastest-growing job above 20 GB (else the newest CPU job) is frozen and pushed to swap. GPU jobs
+free RAM < 5 GB -> the fastest-growing job above 20 GB (else the job > 20 GB over its declaration, else the newest
+CPU job) is frozen and pushed to swap. GPU jobs
 are never frozen. A frozen job is then a waiting job at the head of the queue whose size is known (RAM + swap when
 frozen, at least its declaration, not overbooked); it resumes when that fits above the freeze line + margin, and after resuming that size stays reserved for it. A job too big
 for the machine resumes alone (the part above its cap stays in swap).
@@ -55,7 +56,7 @@ MARGIN_GB = 3.0        # RAM always left free for the OS and the other users
 STALL_RAM_GB = 1.0     # a stalled job is killed only if it holds at least this much RAM
 OVERBOOK = 0.5        # a running job reserves its real RAM use plus this share of the rest of its declaration
 FREEZE_BELOW_GB = 5.0  # free RAM below this: freeze the newest CPU job and push it to swap
-GROWER_GB = 20.0       # a job holding more than this that grew fastest in the last 5 min is frozen first
+GROWER_GB = 20.0       # freeze first: the fastest grower holding more than this, else a job this far over its declaration
 STARVE_MIN = 30       # a job waiting this long for RAM/threads stops later jobs from starting ahead of it
 HOG_RAM_GB, HOG_IDLE_MIN = 2.0, 30   # report idle processes outside the queue above this RAM
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL", re.I)
@@ -563,7 +564,8 @@ def scan_hogs(seen: dict) -> list[dict]:
 
 def mem_guard(g: dict, log):
     """Free RAM below FREEZE_BELOW_GB: freeze a CPU job and push its memory to swap: the fastest-growing job holding more
-    than GROWER_GB, else the newest (HIGH jobs last, GPU jobs never). The daemon pass resumes it like a waiting job."""
+    than GROWER_GB, else the job furthest (> GROWER_GB) over its declaration, else the newest (HIGH jobs last, GPU jobs
+    never). The daemon pass resumes it like a waiting job."""
     t, free = time.time(), mem_available_gb()
     run = jobs(RUNNING)
     hist = g.setdefault("hist", {})       # job id -> [(time, RAM GB)] over the last 5 min
@@ -585,6 +587,11 @@ def mem_guard(g: dict, log):
         big = [c for c in cands if c[2] > GROWER_GB and growth.get(c[0].stem, 0) > 0 and not c[1].get("high")]
         if big:
             cands = sorted(big, key=lambda c: growth[c[0].stem], reverse=True)
+        else:   # no grower: the job furthest over its declaration (RAM + swap) if that excess is above GROWER_GB
+            over = {c[0].stem: c[2] + job_usage(c[1])[1] - c[1]["mem"] for c in cands}
+            over_big = [c for c in cands if over[c[0].stem] > GROWER_GB and not c[1].get("high")]
+            if over_big:
+                cands = sorted(over_big, key=lambda c: over[c[0].stem], reverse=True)
         if not cands:
             if t - g.get("last_warn", 0) > 600:
                 log.write(f"{now()} free RAM {free:.1f} GB but no job can be frozen\n"); g["last_warn"] = t
