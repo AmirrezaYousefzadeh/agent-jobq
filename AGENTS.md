@@ -11,7 +11,7 @@ is room for them. You don't need to start or babysit it.
 ## Submit
 
 ```bash
-jobq add --name <short_name> --threads <T> --mem <peak GB> [--gpu <MB>] [--high] -- <command ...>
+jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [--gpu <MB>] [--high] -- <command ...>
 ```
 
 - `--name`: letters, digits, `_ . + -`. Make it unique within your project (e.g. `train_shd_s1`).
@@ -23,9 +23,16 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> [--gpu <MB>] [--high]
     plus half of the rest of its declaration.
   - Any job may use up to 50 GB of RAM (whatever it declared); beyond that it pages to swap.
   - If free RAM still drops below 5 GB, the memory guard steps in (below). Your job may be paused, never OOM-killed.
+  For a GPU job, `--mem` is the host (CPU) RAM only; GPU memory goes in `--gpu`.
+- `--time`: expected run time (`45m`, `6h`, `2d`; a plain number means hours). Optional, but always give it: it lets
+  your job start earlier (see Waiting). Base it on a previous or smaller run (`done/*.json` has start and end) and
+  round up. The job is never stopped for running longer.
 - `--gpu`: GPU memory in MB. GPU jobs start at least 3 min apart and only if the GPU has that much free.
-- Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill), but a job that has waited
-  30 min for RAM or threads stops all later jobs from starting until it fits, so big jobs do not starve.
+- Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill). A HIGH job, or a job that has
+  waited 30 min for RAM or threads, gets a **reserved start**: the time enough running jobs are expected to have
+  ended (from their `--time`). Later jobs may then start ahead of it only if their `--time` ends before that
+  reserved start, or if it would still fit with them running. A job without `--time` can't start this way.
+  Running jobs without `--time` count as never ending.
 - `--high`: high priority. It starts before every normal job, and normal jobs don't start while a high one waits.
   Use it only when the user asked for it.
 - `--stall-min N` (default 60): the job is killed if it holds more than 1 GB of RAM and uses no CPU for N minutes.
@@ -56,10 +63,11 @@ Finished jobs keep their record in `done/` (rc, start/end, peak RAM, peak swap, 
 
 ## Watchdog (automatic)
 
-- Memory guard, every 5 s: if free RAM falls below 5 GB, the newest running CPU job (HIGH jobs last, GPU jobs never)
-  is **frozen** (it stops where it is) and its memory pushed to swap. It
-  resumes by itself once free RAM minus its swapped-out memory is above 10 GB; no new job starts while one is frozen.
-  `status` shows it as `FROZEN`. A frozen job loses no work, only time.
+- Memory guard, every 5 s: if free RAM falls below 5 GB, a running CPU job is **frozen** (it stops where it is) and
+  its memory pushed to swap: the job that grew fastest in the last 5 min if it holds more than 20 GB, otherwise the
+  newest one (HIGH jobs last, GPU jobs never). It resumes by itself once free RAM minus its swapped-out memory is
+  above 10 GB. Other jobs keep starting around a frozen job; once it has been frozen 2 h, no new job starts until it
+  resumes. `status` shows it as `FROZEN`. A frozen job loses no work, only time.
 
 - Processes left behind by a finished job are killed (they would otherwise hold RAM).
 - A running job that holds > 1 GB and used no CPU for `--stall-min` minutes is killed. `status` marks it `STALLED`
@@ -69,7 +77,7 @@ Finished jobs keep their record in `done/` (rc, start/end, peak RAM, peak swap, 
 
 ## Rules for agents
 
-1. Estimate `--mem` and `--threads` honestly. Measure on a small run first if unsure (`done/*.json` records
+1. Estimate `--mem`, `--threads` and `--time` honestly. Measure on a small run first if unsure (`done/*.json` records
    `peak_ram_gb`).
 2. Don't touch other projects' jobs, and don't `cancel` anything you didn't submit unless the user says so.
 3. `touch $JOBQ_DIR/PAUSE` stops new starts (running jobs continue). Only do this if the user asks.

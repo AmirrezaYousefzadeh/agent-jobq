@@ -16,17 +16,20 @@ There is no server, database or scheduler to set up: the queue is a directory of
 - **RAM-aware admission with overbooking.** Each job declares threads, peak RAM and optional GPU memory. Agents can't
   predict memory well and usually over-declare, so a running job reserves its *real* use plus half of the rest of
   its declaration, and a new job needs half of its declaration plus a 3 GB margin free.
-- **Memory guard instead of the OOM killer.** Every 5 s: if free RAM drops below 5 GB, the newest CPU job is
-  **frozen** (cgroup v2 freezer) and its memory pushed to swap (`memory.reclaim`). It resumes automatically when
-  RAM frees up, losing no work. HIGH-priority jobs are frozen last; GPU jobs are never frozen.
+- **Memory guard instead of the OOM killer.** Every 5 s: if free RAM drops below 5 GB, a CPU job is **frozen**
+  (cgroup v2 freezer) and its memory pushed to swap (`memory.reclaim`): the fastest grower if it holds more than
+  20 GB, else the newest job. It resumes automatically when RAM frees up, losing no work. Other jobs keep starting
+  around it; after 2 h frozen, new starts stop until it resumes. HIGH-priority jobs are frozen last; GPU jobs never.
 - **Swap only for the queue (optional).** With `--exclusive-swap`, logins and system services get no swap, while queue
   jobs may page to swap, e.g. a job needing more RAM than the per-job cap (50 GB by default) keeps running slowly
   instead of dying.
 - **Invisible to interactive users.** Jobs run at `nice 19`, idle I/O priority, in a slice with CPU weight 1. On
   cgroup v2, `nice` only ranks processes within one cgroup, so the slice weight is what keeps the queue below
   everyone else.
-- **Fair ordering.** FIFO with backfill (small jobs start while a big one waits). A job that has waited 30 min stops
-  backfill until it fits, so big jobs don't starve. `--high` jumps the queue.
+- **Fair ordering with time estimates.** FIFO with backfill (small jobs start while a big one waits). A job that has
+  waited 30 min gets a reserved start: when enough running jobs are expected to end, from their `--time` estimates.
+  Later jobs may start ahead of it only if they end before that time or leave it enough RAM (EASY backfill), so
+  big jobs don't starve and short jobs don't sit behind a multi-day run. `--high` jumps the queue.
 - **Watchdog.** Kills processes a finished job left behind, kills jobs that hold RAM but have used no CPU for an hour
   (configurable per job), and reports idle processes outside the queue that hold more than 2 GB.
 - **Live view.** The daemon rewrites `QUEUE.md` every 30 s: a whole-machine usage row, running jobs (CPU/GPU, declared
@@ -63,8 +66,8 @@ folder that contains the queue directory). With `/work/.jobq` and projects in `/
 ## Use
 
 ```bash
-jobq add --name train_s1 --threads 4 --mem 12 --gpu 3000 -- python train.py --seed 1
-jobq add --name route --threads 8 --mem 30 -- 'cd flow && make route > route.log'
+jobq add --name train_s1 --threads 4 --mem 12 --time 3h --gpu 3000 -- python train.py --seed 1
+jobq add --name route --threads 8 --mem 30 --time 1d -- 'cd flow && make route > route.log'
 jobq status            # or: jobq status --json, or open QUEUE.md
 jobq wait train_s1     # exit 0 if the job succeeded
 jobq log train_s1
@@ -98,7 +101,9 @@ Constants at the top of `jobq.py`:
 | `MARGIN_GB` | 3 | RAM always left free |
 | `OVERBOOK` | 0.5 | share of a job's unused declaration that is reserved |
 | `FREEZE_BELOW_GB` / `RESUME_ABOVE_GB` | 5 / 10 | memory guard thresholds |
-| `STARVE_MIN` | 30 | minutes before a waiting job stops backfill |
+| `STARVE_MIN` | 30 | minutes before a waiting job gets a reserved start |
+| `DRAIN_AFTER_H` | 2 | hours frozen before new starts stop for that job |
+| `GROWER_GB` | 20 | a fast-growing job above this is frozen first |
 | `STALL_RAM_GB` | 1 | a job is only killed as stalled if it holds this much RAM |
 
 `touch <queue dir>/RELOAD` loads new code without stopping jobs. `touch <queue dir>/PAUSE` stops new starts.
