@@ -28,7 +28,7 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
   your job start earlier (see Waiting). Base it on a previous or smaller run (`done/*.json` has start and end) and
   round up. The job is never stopped for running longer.
 - `--gpu`: GPU memory in MB. GPU jobs start at least 3 min apart and only if the GPU has that much free.
-- Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill). A HIGH job, or a job that has
+- Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill). A frozen or HIGH job, or a job that has
   waited 30 min for RAM or threads, gets a **reserved start**: the time enough running jobs are expected to have
   ended (from their `--time`). Later jobs may then start ahead of it only if their `--time` ends before that
   reserved start, or if it would still fit with them running. A job without `--time` can't start this way.
@@ -65,9 +65,10 @@ Finished jobs keep their record in `done/` (rc, start/end, peak RAM, peak swap, 
 
 - Memory guard, every 5 s: if free RAM falls below 5 GB, a running CPU job is **frozen** (it stops where it is) and
   its memory pushed to swap: the job that grew fastest in the last 5 min if it holds more than 20 GB, otherwise the
-  newest one (HIGH jobs last, GPU jobs never). It resumes by itself once free RAM minus its swapped-out memory is
-  above 10 GB. Other jobs keep starting around a frozen job; once it has been frozen 2 h, no new job starts until it
-  resumes. `status` shows it as `FROZEN`. A frozen job loses no work, only time.
+  newest one (HIGH jobs last, GPU jobs never). A frozen job then heads the waiting list with its real size (RAM + swap
+  when frozen): it resumes by itself when that fits, gets a reserved start like any waiting big job, and after
+  resuming that full size stays reserved for it. A job too big for the machine resumes alone (the part above the
+  50 GB cap stays in swap). `status` shows it as `FROZEN`. A frozen job loses no work, only time.
 
 - Processes left behind by a finished job are killed (they would otherwise hold RAM).
 - A running job that holds > 1 GB and used no CPU for `--stall-min` minutes is killed. `status` marks it `STALLED`

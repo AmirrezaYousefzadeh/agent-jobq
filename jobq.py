@@ -12,10 +12,11 @@ pending job only when
 Jobs run under `nice -n 19 ionice -c3` in jobq.slice (CPU weight 1: other users' work always wins). Each job gets its
 own cgroup with a 50 GB RAM cap (beyond it, swap). Admission overbooks: a running job reserves its real use plus half
 of the rest of its declaration, and a new job needs half of its declaration (+ margin) free. Memory guard (every 5 s):
-free RAM < 5 GB -> the fastest-growing job above 20 GB (else the newest CPU job) is frozen and pushed to swap; it
-resumes when RAM frees up. Other jobs start around a frozen job; after 2 h frozen, new starts stop until it resumes.
-GPU jobs are never frozen.
-Backfill with time estimates (--time): when a high-priority or long-waiting job is blocked by memory, it gets a reserved
+free RAM < 5 GB -> the fastest-growing job above 20 GB (else the newest CPU job) is frozen and pushed to swap. GPU jobs
+are never frozen. A frozen job is then a waiting job at the head of the queue whose size is known (RAM + swap when
+frozen, not overbooked); it resumes when that fits, and after resuming that size stays reserved for it. A job too big
+for the machine resumes alone (the part above its cap stays in swap).
+Backfill with time estimates (--time): when a frozen, high-priority or long-waiting job is blocked by memory, it gets a reserved
 start time (when enough running jobs are expected to have ended); a later job may start ahead of it only if its own
 estimate ends before that time, or if it fits in RAM that stays spare at that time. Running jobs without an estimate
 count as never ending; an overrunning job is expected to end now (it is never stopped for overrunning).
@@ -54,8 +55,6 @@ MARGIN_GB = 3.0        # RAM always left free for the OS and the other users
 STALL_RAM_GB = 1.0     # a stalled job is killed only if it holds at least this much RAM
 OVERBOOK = 0.5        # a running job reserves its real RAM use plus this share of the rest of its declaration
 FREEZE_BELOW_GB = 5.0  # free RAM below this: freeze the newest CPU job and push it to swap
-RESUME_ABOVE_GB = 10.0 # a frozen job resumes when free RAM minus its swapped-out memory stays above this
-DRAIN_AFTER_H = 2.0    # other jobs keep starting around a frozen job; after this long frozen, new starts stop until it resumes
 GROWER_GB = 20.0       # a job holding more than this that grew fastest in the last 5 min is frozen first
 STARVE_MIN = 30       # a job waiting this long for RAM/threads stops later jobs from starting ahead of it
 HOG_RAM_GB, HOG_IDLE_MIN = 2.0, 30   # report idle processes outside the queue above this RAM
@@ -304,11 +303,14 @@ def status_dict(n_done: int) -> dict:
     for f, j in jobs(RUNNING):
         ram, swap, _ = job_usage(j)
         running.append({k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "pid", "started",
-                                              "log", "stalled_since", "frozen", "time_h", "early")} | {"id": f.stem, "ram_gb": round(ram, 2),
+                                              "log", "stalled_since", "frozen", "time_h", "early", "shown_gb")} | {"id": f.stem, "ram_gb": round(ram, 2),
                                                                          "swap_gb": round(swap, 2), "ram_cap_gb": ram_limit(j)})
-    pending = [{k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "added", "time_h")}
+    # frozen jobs head the waiting list (oldest first): they wait to resume
+    frozen = sorted([(f, j | {"added": j["frozen"]}) for f, j in jobs(RUNNING) if j.get("frozen")],
+                    key=lambda fj: fj[1].get("started") or "")
+    pending = [{k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "added", "time_h", "frozen")}
                | {"id": f.stem, "waiting_for": st.get("waiting", {}).get(f.stem, "next daemon pass")}
-               for f, j in sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), fj[0].name))]
+               for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), fj[0].name))]
     done = [{k: j.get(k) for k in ("name", "project", "rc", "started", "ended", "log", "mem", "peak_ram_gb",
                                    "peak_swap_gb", "killed")} | {"id": f.stem} for f, j in sorted(jobs(DONE), key=lambda fj: fj[1].get("ended") or "")[-n_done:][::-1]]
     up = alive(st.get("pid")) and time.time() - st.get("heartbeat", 0) < 120
@@ -379,11 +381,13 @@ def render_md(s: dict) -> str:
           "a waiting job because it is expected to end before that job's reserved start."]
     L += ["", f"## Next up ({len(s['pending'])}, in start order)", ""]
     if s["pending"]:
-        rows = [[i, f"{p['project']}/{p['name']}", "HIGH" if p["high"] else "", p["added"][5:16], cg_text(p),
+        rows = [[i, f"{p['project']}/{p['name']}", "FROZEN" if p.get("frozen") else "HIGH" if p["high"] else "",
+                 p["added"][5:16], cg_text(p),
                  f"{p['mem']:.1f}", dur(p.get("time_h")), p["waiting_for"]] for i, p in enumerate(s["pending"], 1)]
         L += table(["#", "Job", "Prio", "Queued", "CPU/GPU", "Decl GB", "Time", "Waiting for"], rows, "rllllrrl")
-        L += ["", "Smaller jobs further down may start first when they fit (backfill). Ahead of a HIGH job or a job that "
-              "has waited more than 30 min, only jobs whose --time ends before its reserved start, or that leave it "
+        L += ["", "FROZEN jobs (Queued = frozen at) resume first, when the RAM + swap they have shown fits. Smaller jobs "
+              "further down may start first when they fit (backfill). Ahead of a FROZEN or HIGH job or a job that has "
+              "waited more than 30 min, only jobs whose --time ends before its reserved start, or that leave it "
               "enough RAM, may start."]
     else:
         L.append("Queue empty.")
@@ -551,8 +555,7 @@ def scan_hogs(seen: dict) -> list[dict]:
 
 def mem_guard(g: dict, log):
     """Free RAM below FREEZE_BELOW_GB: freeze a CPU job and push its memory to swap: the fastest-growing job holding more
-    than GROWER_GB, else the newest (HIGH jobs last, GPU jobs never). Free RAM above RESUME_ABOVE_GB: thaw the oldest
-    frozen job that fits."""
+    than GROWER_GB, else the newest (HIGH jobs last, GPU jobs never). The daemon pass resumes it like a waiting job."""
     t, free = time.time(), mem_available_gb()
     run = jobs(RUNNING)
     hist = g.setdefault("hist", {})       # job id -> [(time, RAM GB)] over the last 5 min
@@ -584,32 +587,11 @@ def mem_guard(g: dict, log):
             Path(j["cgroup"], "cgroup.freeze").write_text("1")
         except OSError as e:
             log.write(f"{now()} cannot freeze {j['name']}: {e}\n"); return
-        j["frozen"] = now(); save(f, j)
+        j["frozen"] = now(); j["shown_gb"] = round(max(j.get("shown_gb", 0), ram + job_usage(j)[1]), 1); save(f, j)
         # push the frozen job's memory to swap in the background (the write blocks until it is reclaimed)
         subprocess.Popen(["sh", "-c", f"echo {int(ram * 1024 ** 3)} > {j['cgroup']}/memory.reclaim"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log.write(f"{now()} free RAM {free:.1f} GB: froze {j['project']}/{j['name']} ({ram:.1f} GB to swap)\n")
-    elif free > RESUME_ABOVE_GB and t - g.get("last_thaw", 0) > 60:
-        fr = sorted([(f, j) for f, j in run if j.get("frozen")], key=lambda fj: fj[1].get("started") or "")
-        if not fr:
-            return
-        others_active = any(not x.get("frozen") for _, x in run)
-        # oldest first, but a frozen job that cannot come back yet must not keep a smaller one frozen
-        for f, j in fr:
-            ram, swap, _ = job_usage(j)
-            back = min(swap, max(0.0, ram_limit(j) - ram))     # what it pages back into RAM (at most up to its cap)
-            if free - back >= RESUME_ABOVE_GB or not others_active:
-                break
-        else:
-            return
-        try:
-            Path(j["cgroup"], "cgroup.freeze").write_text("0")
-        except OSError as e:
-            log.write(f"{now()} cannot thaw {j['name']}: {e}\n")
-        j["frozen_min"] = j.get("frozen_min", 0) + int((t - time.mktime(time.strptime(j["frozen"], "%Y-%m-%d %H:%M:%S"))) / 60)
-        j.pop("frozen"); save(f, j); g["last_thaw"] = t
-        log.write(f"{now()} free RAM {free:.1f} GB: resumed {j['project']}/{j['name']}\n")
-
 
 def cmd_daemon(a):
     for d in (PENDING, RUNNING, DONE, LOGS):
@@ -674,65 +656,102 @@ def cmd_daemon(a):
                         os.waitpid(int(d), os.WNOHANG)
                 except (OSError, IndexError, ValueError):
                     pass
-        running = [j for _, j in jobs(RUNNING)]
-        sweep_cgroups({j.get("cgroup") for j in running if j.get("cgroup")})
-        threads = sum(j["threads"] for j in running)
-        used = [job_usage(j)[0] for j in running]
+        running = jobs(RUNNING)
+        sweep_cgroups({j.get("cgroup") for _, j in running if j.get("cgroup")})
+        threads = sum(j["threads"] for _, j in running)
+        usage = {f.stem: job_usage(j) for f, j in running}
+        for f, j in running:     # a frozen job has shown that it needs at least its RAM + swap
+            ram, swap, _ = usage[f.stem]
+            if j.get("frozen") and ram + swap > j.get("shown_gb", 0) + 0.1:
+                j["shown_gb"] = round(ram + swap, 1); save(f, j)
+
+        def reserve(j, u):
+            """RAM a running job holds or may still take: after a freeze its whole shown size (up to its cap), else its
+            real use plus OVERBOOK x the unused part of its declaration."""
+            if j.get("shown_gb"):
+                return max(u, min(j["shown_gb"], ram_limit(j)))
+            return u + OVERBOOK * max(0.0, charge(j) - u)
+        live = [(j, usage[f.stem][0]) for f, j in running if not j.get("frozen")]
         free_now = mem_available_gb()
-        avail = free_now - OVERBOOK * sum(max(0.0, charge(j) - u) for j, u in zip(running, used) if not j.get("frozen"))
-        def frozen_h(j):
-            return (time.time() - ts(j["frozen"])) / 3600
-        drain = [j for j in running if j.get("frozen") and frozen_h(j) > DRAIN_AFTER_H]
-        any_frozen = any(j.get("frozen") for j in running)
-        empty_queue_free = free_now + sum(used)   # RAM free if every queue job ended (the rest belongs to others)
-        # anti-starvation: a high-priority job, or one that waited STARVE_MIN for RAM or threads (and would fit in an
-        # empty queue), is "urgent"; once an urgent job cannot start, no later job starts ahead of it (no backfill)
+        avail = free_now - sum(reserve(j, u) - u for j, u in live)
+        empty_queue_free = free_now + sum(u[0] for u in usage.values())   # RAM free if every queue job ended
+
+        def need(f, j):
+            """Free RAM a pending job needs to start, or a frozen job to resume (its shown size, no overbooking)."""
+            if not j.get("frozen"):
+                return OVERBOOK * charge(j) + a.margin
+            ram = usage[f.stem][0]
+            # a job too big for the machine resumes alone (the part above its cap stays in swap)
+            return min(min(j["shown_gb"], ram_limit(j)) - ram + a.margin, empty_queue_free - ram - 0.5)
+
+        # anti-starvation: a frozen job, a high-priority job, or one that waited STARVE_MIN for RAM or threads (and
+        # would fit in an empty queue) is "urgent"; once an urgent job cannot start, it gets a reserved start and later
+        # jobs start ahead of it only if they end before that time or leave it enough RAM
         def urgent(j):
-            waited = time.time() - ts(j["added"])
-            # while a job is frozen RAM is already overbooked: a waiting big job must not also hold back the small ones
-            return j.get("high") or (waited > 60 * STARVE_MIN and not any_frozen
-                                     and empty_queue_free >= OVERBOOK * charge(j) + a.margin)
-        # (expected end, RAM given back at the end) of each running job, for the blocked urgent job's reserved start
-        releases = [(end_ts(j), u + OVERBOOK * max(0.0, charge(j) - u)) for j, u in zip(running, used) if not j.get("frozen")]
+            if j.get("frozen") or j.get("high"):
+                return True
+            return (time.time() - ts(j["added"]) > 60 * STARVE_MIN
+                    and empty_queue_free >= OVERBOOK * charge(j) + a.margin)
+        # (expected end, RAM given back at the end, spare_of) of each running job, for the blocked urgent job's reserved
+        # start; a job started in a blocker's spare RAM does not count as giving RAM back to that blocker
+        releases = [(end_ts(j), reserve(j, u), j.get("spare_of")) for j, u in live]
         waiting, blocker = {}, None
         shadow, spare = None, 0.0     # reserved start of the blocker (None: no backfill), RAM still spare at that time
         paused = (Q / "PAUSE").exists()
-        for f, j in sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), not urgent(fj[1]), fj[0].name)):
-            why = None
-            if paused:
+        # frozen jobs first (oldest first): they are waiting jobs whose size is known
+        frozen = sorted([(f, j) for f, j in running if j.get("frozen")], key=lambda fj: fj[1].get("started") or "")
+        for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), not urgent(fj[1]), fj[0].name)):
+            why, fz = None, bool(j.get("frozen"))
+            take = need(f, j) - a.margin
+            if paused and not fz:
                 why = "PAUSE file"
-            elif drain:
-                why = f"{drain[0]['project']}/{drain[0]['name']} (frozen > {DRAIN_AFTER_H:g} h, machine draining for it)"
-            elif blocker and not (shadow is not None and (j.get("time_h") and time.time() + 3600 * j["time_h"] <= shadow
-                                                         or OVERBOOK * charge(j) <= spare)):
+            elif blocker and not (shadow is not None and (not fz and j.get("time_h")
+                                                         and time.time() + 3600 * j["time_h"] <= shadow
+                                                         or take <= spare)):
                 why = f"{blocker} (waiting longer)"
-            elif threads + j["threads"] > budget and threads > 0:
+            elif not fz and threads + j["threads"] > budget and threads > 0:
                 why = f"threads ({threads} of {budget} in use)"
-            elif avail < OVERBOOK * charge(j) + a.margin:
-                why = f"memory (needs {OVERBOOK * charge(j) + a.margin:.1f} GB, {avail:.1f} GB free)"
-            elif j["gpu"] > 0 and (time.time() - last_gpu_start < 180 or gpu_free_mb() < j["gpu"] + 500):
+            elif fz and time.time() - ts(j["frozen"]) < 60:
+                why = "just frozen"
+            elif avail < need(f, j):
+                why = f"memory (needs {need(f, j):.1f} GB, {avail:.1f} GB free)"
+            elif not fz and j["gpu"] > 0 and (time.time() - last_gpu_start < 180 or gpu_free_mb() < j["gpu"] + 500):
                 # GPU memory is reported lazily by a just-started job: leave 3 min between GPU starts
                 why = "GPU memory"
             if why:
                 waiting[f.stem] = why
-                if not paused and not blocker and urgent(j) and not why.startswith("GPU"):
+                if (fz or not paused) and not blocker and urgent(j) and why.startswith(("memory", "threads")):
                     blocker = f"{j['project']}/{j['name']}"
                     if why.startswith("memory"):   # reserve its start: the first time enough running jobs have ended
-                        need, free_then, shadow = OVERBOOK * charge(j) + a.margin, avail, float("inf")
-                        for e, back in sorted(releases):
+                        free_then, shadow = avail, float("inf")
+                        for e, back, of in sorted(releases, key=lambda r: r[:2]):
+                            if of == blocker:
+                                continue
                             free_then += back
-                            if free_then >= need:
-                                shadow, spare = e, free_then - need
+                            if free_then >= need(f, j):
+                                shadow, spare = e, free_then - need(f, j)
                                 break
                         why += ("; reserved start ~" + time.strftime("%m-%d %H:%M", time.localtime(shadow))
                                 if shadow < float("inf") else "; start time unknown (running jobs without --time)")
                         waiting[f.stem] = why
                 continue
             if blocker:
-                if j.get("time_h") and time.time() + 3600 * j["time_h"] <= shadow:
+                if not fz and j.get("time_h") and time.time() + 3600 * j["time_h"] <= shadow:
                     j["early"] = blocker
                 else:
-                    spare -= OVERBOOK * charge(j)
+                    spare -= take
+                    j["spare_of"] = blocker
+            if fz:
+                try:
+                    Path(j["cgroup"], "cgroup.freeze").write_text("0")
+                except OSError as e:
+                    log.write(f"{now()} cannot thaw {j['name']}: {e}\n")
+                j["frozen_min"] = j.get("frozen_min", 0) + int((time.time() - ts(j["frozen"])) / 60)
+                j.pop("frozen"); save(f, j)
+                avail -= take; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
+                log.write(f"{now()} resumed {j['project']}/{j['name']} (shown size {j['shown_gb']:.1f} GB, "
+                          f"free {avail + take:.1f} GB)\n")
+                continue
             if j["gpu"] > 0:
                 last_gpu_start = time.time()
             env = dict(j.get("env") or os.environ)
@@ -761,7 +780,7 @@ def cmd_daemon(a):
             j |= {"pid": p.pid, "started": now(), "log": str(logf), "cgroup": str(cg) if cg else None}
             save(RUNNING / f.name, j); f.unlink(); procs[f.stem] = p
             threads += j["threads"]; avail -= OVERBOOK * charge(j)
-            releases.append((end_ts(j), OVERBOOK * charge(j)))
+            releases.append((end_ts(j), OVERBOOK * charge(j), j.get("spare_of")))
             log.write(f"{now()} start {j['project']}/{j['name']} pid {p.pid} thr {j['threads']} mem {j['mem']} "
                       f"cap {ram_limit(j):.1f} GB (free {avail + OVERBOOK * charge(j):.1f} GB, threads now {threads})\n")
         if tick % 10 == 0:
