@@ -301,6 +301,8 @@ def status_dict(n_done: int) -> dict:
     st = state()
     running = []
     for f, j in jobs(RUNNING):
+        if j.get("frozen"):     # listed with the waiting jobs below
+            continue
         ram, swap, _ = job_usage(j)
         running.append({k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "pid", "started",
                                               "log", "stalled_since", "frozen", "time_h", "early", "shown_gb")} | {"id": f.stem, "ram_gb": round(ram, 2),
@@ -308,8 +310,9 @@ def status_dict(n_done: int) -> dict:
     # frozen jobs head the waiting list (oldest first): they wait to resume
     frozen = sorted([(f, j | {"added": j["frozen"]}) for f, j in jobs(RUNNING) if j.get("frozen")],
                     key=lambda fj: fj[1].get("started") or "")
-    pending = [{k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "added", "time_h", "frozen")}
-               | {"id": f.stem, "waiting_for": st.get("waiting", {}).get(f.stem, "next daemon pass")}
+    pending = [{k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "added", "time_h", "frozen",
+                                      "shown_gb")}
+               | ({"swap_gb": round(job_usage(j)[1], 2)} if j.get("frozen") else {}) | {"id": f.stem, "waiting_for": st.get("waiting", {}).get(f.stem, "next daemon pass")}
                for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), fj[0].name))]
     done = [{k: j.get(k) for k in ("name", "project", "rc", "started", "ended", "log", "mem", "peak_ram_gb",
                                    "peak_swap_gb", "killed")} | {"id": f.stem} for f, j in sorted(jobs(DONE), key=lambda fj: fj[1].get("ended") or "")[-n_done:][::-1]]
@@ -371,7 +374,7 @@ def render_md(s: dict) -> str:
              f"{u['swap_used_gb']:.1f}/{u['swap_total_gb']}", ""]]
     for r in sorted(s["running"], key=lambda r: r["started"] or ""):
         flag = (" HIGH" if r.get("high") else "") + (" STALLED" if r.get("stalled_since") else "") + \
-               (" FROZEN" if r.get("frozen") else "") + (" (early)" if r.get("early") else "")
+               (" (early)" if r.get("early") else "")
         e = end_ts(r)
         ends = "?" if e == float("inf") else "late" if e <= time.time() + 60 else time.strftime("%m-%d %H:%M", time.localtime(e))
         rows.append([f"{r['project']}/{r['name']}{flag}", since(r["started"]), cg_text(r),
@@ -433,13 +436,14 @@ def cmd_status(a):
           f"MemAvailable {s['mem_available_gb']} GB, GPU free {s['gpu_free_mb']:.0f} MB, "
           f"per-job cgroups {'yes' if s['cgroups'] else 'NO'}")
     for r in s["running"]:
-        stall = (f"  STALLED since {r['stalled_since']}" if r.get("stalled_since") else "") + \
-                (f"  FROZEN since {r['frozen']}" if r.get("frozen") else "")
+        stall = f"  STALLED since {r['stalled_since']}" if r.get("stalled_since") else ""
         print(f"RUNNING  {r['project'] + '/' + r['name']:45s} thr {r['threads']:2d} mem {r['mem']:5.1f} GB  "
               f"now {r['ram_gb']:5.1f} GB + swap {r['swap_gb']:5.1f} GB  since {r['started']}{stall}")
     for p in s["pending"]:
-        print(f"PENDING{'*' if p['high'] else ' '} {p['project'] + '/' + p['name']:45s} thr {p['threads']:2d} "
-              f"mem {p['mem']:5.1f} GB  waits for {p['waiting_for']}")
+        print(f"{'FROZEN  ' if p.get('frozen') else 'PENDING*' if p['high'] else 'PENDING '} "
+              f"{p['project'] + '/' + p['name']:45s} thr {p['threads']:2d} mem {p['mem']:5.1f} GB  "
+              + (f"swap {p['swap_gb']:5.1f} GB  since {p['frozen']}  " if p.get("frozen") else "")
+              + f"waits for {p['waiting_for']}")
     for d in s["done"]:
         extra = f"  ({d['killed']})" if d.get("killed") else ""
         print(f"DONE     {d['project'] + '/' + d['name']:45s} rc {d['rc']}  {d['started']} -> {d['ended']}{extra}")
@@ -658,7 +662,7 @@ def cmd_daemon(a):
                     pass
         running = jobs(RUNNING)
         sweep_cgroups({j.get("cgroup") for _, j in running if j.get("cgroup")})
-        threads = sum(j["threads"] for _, j in running)
+        threads = sum(j["threads"] for _, j in running if not j.get("frozen"))   # a frozen job uses no CPU
         usage = {f.stem: job_usage(j) for f, j in running}
         for f, j in running:     # a frozen job has shown that it needs at least its RAM + swap
             ram, swap, _ = usage[f.stem]
@@ -709,7 +713,7 @@ def cmd_daemon(a):
                                                          and time.time() + 3600 * j["time_h"] <= shadow
                                                          or take <= spare)):
                 why = f"{blocker} (waiting longer)"
-            elif not fz and threads + j["threads"] > budget and threads > 0:
+            elif threads + j["threads"] > budget and threads > 0:
                 why = f"threads ({threads} of {budget} in use)"
             elif fz and time.time() - ts(j["frozen"]) < 60:
                 why = "just frozen"
@@ -748,7 +752,7 @@ def cmd_daemon(a):
                     log.write(f"{now()} cannot thaw {j['name']}: {e}\n")
                 j["frozen_min"] = j.get("frozen_min", 0) + int((time.time() - ts(j["frozen"])) / 60)
                 j.pop("frozen"); save(f, j)
-                avail -= take; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
+                threads += j["threads"]; avail -= take; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
                 log.write(f"{now()} resumed {j['project']}/{j['name']} (shown size {j['shown_gb']:.1f} GB, "
                           f"free {avail + take:.1f} GB)\n")
                 continue
