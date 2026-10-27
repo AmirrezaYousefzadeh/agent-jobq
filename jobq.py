@@ -14,7 +14,7 @@ own cgroup with a 50 GB RAM cap (beyond it, swap). Admission overbooks: a runnin
 of the rest of its declaration, and a new job needs half of its declaration (+ margin) free. Memory guard (every 5 s):
 free RAM < 5 GB -> the fastest-growing job above 20 GB (else the newest CPU job) is frozen and pushed to swap. GPU jobs
 are never frozen. A frozen job is then a waiting job at the head of the queue whose size is known (RAM + swap when
-frozen, not overbooked); it resumes when that fits, and after resuming that size stays reserved for it. A job too big
+frozen, at least its declaration, not overbooked); it resumes when that fits above the freeze line + margin, and after resuming that size stays reserved for it. A job too big
 for the machine resumes alone (the part above its cap stays in swap).
 Backfill with time estimates (--time): when a frozen, high-priority or long-waiting job is blocked by memory, it gets a reserved
 start time (when enough running jobs are expected to have ended); a later job may start ahead of it only if its own
@@ -175,6 +175,12 @@ def job_usage(j: dict) -> tuple[float, float, float]:
 
 def ram_limit(j: dict) -> float:
     return j["ram"] if j.get("ram") else BIG_GB
+
+
+def known_size(j: dict) -> float:
+    """RAM a job that has been frozen will take: what it has shown (RAM + swap when frozen) or its declaration,
+    whichever is larger (it may not have reached its peak yet), up to its cap."""
+    return min(max(j.get("shown_gb", 0), j["mem"]), ram_limit(j))
 
 
 def charge(j: dict) -> float:
@@ -668,23 +674,28 @@ def cmd_daemon(a):
                 j["shown_gb"] = round(ram + swap, 1); save(f, j)
 
         def reserve(j, u):
-            """RAM a running job holds or may still take: after a freeze its whole shown size (up to its cap), else its
-            real use plus OVERBOOK x the unused part of its declaration."""
+            """RAM a running job holds or may still take: after a freeze its whole known size, else its real use plus
+            OVERBOOK x the unused part of its declaration."""
             if j.get("shown_gb"):
-                return max(u, min(j["shown_gb"], ram_limit(j)))
+                return max(u, known_size(j))
             return u + OVERBOOK * max(0.0, charge(j) - u)
         live = [(j, usage[f.stem][0]) for f, j in running if not j.get("frozen")]
         free_now = mem_available_gb()
         avail = free_now - sum(reserve(j, u) - u for j, u in live)
         empty_queue_free = free_now + sum(u[0] for u in usage.values())   # RAM free if every queue job ended
 
+        def take(f, j):
+            """RAM a pending job is counted for when it starts (overbooked), or a frozen job when it resumes (its known
+            size, no overbooking)."""
+            return known_size(j) - usage[f.stem][0] if j.get("frozen") else OVERBOOK * charge(j)
+
         def need(f, j):
-            """Free RAM a pending job needs to start, or a frozen job to resume (its shown size, no overbooking)."""
+            """Free RAM a job needs to start or resume. A resume must leave free RAM above the freeze line (plus the
+            margin), or the memory guard freezes the job again within minutes."""
             if not j.get("frozen"):
-                return OVERBOOK * charge(j) + a.margin
-            ram = usage[f.stem][0]
+                return take(f, j) + a.margin
             # a job too big for the machine resumes alone (the part above its cap stays in swap)
-            return min(min(j["shown_gb"], ram_limit(j)) - ram + a.margin, empty_queue_free - ram - 0.5)
+            return min(take(f, j) + FREEZE_BELOW_GB + a.margin, empty_queue_free - usage[f.stem][0] - 0.5)
 
         # anti-starvation: a frozen job, a high-priority job, or one that waited STARVE_MIN for RAM or threads (and
         # would fit in an empty queue) is "urgent"; once an urgent job cannot start, it gets a reserved start and later
@@ -704,12 +715,12 @@ def cmd_daemon(a):
         frozen = sorted([(f, j) for f, j in running if j.get("frozen")], key=lambda fj: fj[1].get("started") or "")
         for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), not urgent(fj[1]), fj[0].name)):
             why, fz = None, bool(j.get("frozen"))
-            take = need(f, j) - a.margin
+            took = take(f, j)
             if paused and not fz:
                 why = "PAUSE file"
             elif blocker and not (shadow is not None and (not fz and j.get("time_h")
                                                          and time.time() + 3600 * j["time_h"] <= shadow
-                                                         or take <= spare)):
+                                                         or took <= spare)):
                 why = f"{blocker} (waiting longer)"
             elif threads + j["threads"] > budget and threads > 0:
                 why = f"threads ({threads} of {budget} in use)"
@@ -741,7 +752,7 @@ def cmd_daemon(a):
                 if not fz and j.get("time_h") and time.time() + 3600 * j["time_h"] <= shadow:
                     j["early"] = blocker
                 else:
-                    spare -= take
+                    spare -= took
                     j["spare_of"] = blocker
             if fz:
                 try:
@@ -750,9 +761,9 @@ def cmd_daemon(a):
                     log.write(f"{now()} cannot thaw {j['name']}: {e}\n")
                 j["frozen_min"] = j.get("frozen_min", 0) + int((time.time() - ts(j["frozen"])) / 60)
                 j.pop("frozen"); save(f, j)
-                threads += j["threads"]; avail -= take; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
+                threads += j["threads"]; avail -= took; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
                 log.write(f"{now()} resumed {j['project']}/{j['name']} (shown size {j['shown_gb']:.1f} GB, "
-                          f"free {avail + take:.1f} GB)\n")
+                          f"free {avail + took:.1f} GB)\n")
                 continue
             if j["gpu"] > 0:
                 last_gpu_start = time.time()

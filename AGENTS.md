@@ -65,8 +65,9 @@ Finished jobs keep their record in `done/` (rc, start/end, peak RAM, peak swap, 
 
 - Memory guard, every 5 s: if free RAM falls below 5 GB, a running CPU job is **frozen** (it stops where it is) and
   its memory pushed to swap: the job that grew fastest in the last 5 min if it holds more than 20 GB, otherwise the
-  newest one (HIGH jobs last, GPU jobs never). A frozen job then heads the waiting list with its real size (RAM + swap
-  when frozen): it resumes by itself when that fits, gets a reserved start like any waiting big job, and after
+  newest one (HIGH jobs last, GPU jobs never). A frozen job then heads the waiting list with its known size (RAM + swap
+  when frozen, or its declaration if larger): it resumes by itself when that fits with free RAM still 8 GB above
+  zero (5 GB freeze line + 3 GB margin), gets a reserved start like any waiting big job, and after
   resuming that full size stays reserved for it. A job too big for the machine resumes alone (the part above the
   50 GB cap stays in swap). `status` shows it as `FROZEN`. A frozen job loses no work, only time.
 

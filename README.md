@@ -18,8 +18,8 @@ There is no server, database or scheduler to set up: the queue is a directory of
   its declaration, and a new job needs half of its declaration plus a 3 GB margin free.
 - **Memory guard instead of the OOM killer.** Every 5 s: if free RAM drops below 5 GB, a CPU job is **frozen**
   (cgroup v2 freezer) and its memory pushed to swap (`memory.reclaim`): the fastest grower if it holds more than
-  20 GB, else the newest job. The frozen job then heads the waiting list with the size it has shown (RAM + swap):
-  it resumes when that fits, losing no work, and keeps that size reserved afterwards so it isn't frozen again by
+  20 GB, else the newest job. The frozen job then heads the waiting list with the size it has shown (RAM + swap,
+  at least its declaration): it resumes when that fits and leaves free RAM above the freeze line, losing no work, and keeps that size reserved afterwards so it isn't frozen again by
   the next job. HIGH-priority jobs are frozen last; GPU jobs never.
 - **Swap only for the queue (optional).** With `--exclusive-swap`, logins and system services get no swap, while queue
   jobs may page to swap, e.g. a job needing more RAM than the per-job cap (50 GB by default) keeps running slowly
