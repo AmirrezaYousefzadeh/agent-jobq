@@ -375,13 +375,11 @@ def render_md(s: dict) -> str:
     for r in sorted(s["running"], key=lambda r: r["started"] or ""):
         flag = (" HIGH" if r.get("high") else "") + (" STALLED" if r.get("stalled_since") else "") + \
                (" (early)" if r.get("early") else "")
-        e = end_ts(r)
-        ends = "?" if e == float("inf") else "late" if e <= time.time() + 60 else time.strftime("%m-%d %H:%M", time.localtime(e))
         rows.append([f"{r['project']}/{r['name']}{flag}", since(r["started"]), cg_text(r),
-                     f"{r['mem']:.1f}", f"{r['ram_gb']:.1f}", f"{r['swap_gb']:.1f}", ends])
-    L += table(["Job", "For", "CPU/GPU", "Decl GB", "RAM GB", "Swap GB", "Ends ~"], rows, "lllrrrl")
-    L += ["", "Ends ~: start + the job's --time estimate (? = no estimate, late = past it). (early) = started ahead of "
-          "a waiting job because it is expected to end before that job's reserved start."]
+                     f"{r['mem']:.1f}", f"{r['ram_gb']:.1f}", f"{r['swap_gb']:.1f}", dur(r.get("time_h"))])
+    L += table(["Job", "For", "CPU/GPU", "Decl GB", "RAM GB", "Swap GB", "Decl time"], rows, "lllrrrr")
+    L += ["", "Decl time: the job's --time estimate (- = none). (early) = started ahead of a waiting job because it is "
+          "expected to end before that job's reserved start."]
     L += ["", f"## Next up ({len(s['pending'])}, in start order)", ""]
     if s["pending"]:
         rows = [[i, f"{p['project']}/{p['name']}", "FROZEN" if p.get("frozen") else "HIGH" if p["high"] else "",
