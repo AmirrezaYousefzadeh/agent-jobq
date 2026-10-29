@@ -98,7 +98,7 @@ Constants at the top of `jobq.py`:
 | Constant | Default | Meaning |
 |---|---|---|
 | `BIG_GB` | 50 | RAM cap of one job; beyond it the job pages to swap |
-| `THREAD_BUDGET` | 1.5 × cores | sum of declared threads of running jobs |
+| `THREAD_BUDGET` | 1.5 × usable CPUs | sum of declared threads of running jobs (usable = the daemon's CPU affinity) |
 | `MARGIN_GB` | 3 | RAM always left free |
 | `OVERBOOK` | 0.5 | share of a job's unused declaration that is reserved |
 | `FREEZE_BELOW_GB` | 5 | free RAM below which the memory guard freezes a job |

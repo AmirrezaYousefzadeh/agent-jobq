@@ -44,7 +44,9 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
 - Shell syntax works if you pass one string: `jobq add --name x --mem 4 -- 'cd sub && make -j4 > out.txt'`.
 
 Jobs run at `nice 19`, idle I/O priority and the lowest CPU weight, so other users never notice them. On machines
-installed with `--exclusive-swap`, only queue jobs may use swap.
+installed with `--exclusive-swap`, only queue jobs may use swap. Jobs inherit the daemon's CPU affinity (QUEUE.md
+shows it when it is not every CPU, e.g. a faulty core fenced off): don't widen it with `taskset`/`numactl` unless the
+user asks.
 
 ## Check
 

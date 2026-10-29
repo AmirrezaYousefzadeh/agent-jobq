@@ -5,7 +5,8 @@ State lives next to this file (or in $JOBQ_DIR); AGENTS.md is the guide for the 
 
 Every job declares the threads it uses, the peak memory it may need and (optionally) the GPU memory. The daemon starts a
 pending job only when
-  * the threads of the running jobs plus the job's threads stay within the budget (default 1.5 x cores),
+  * the threads of the running jobs plus the job's threads stay within the budget (default 1.5 x the CPUs the daemon
+    may use; jobs inherit its CPU affinity),
   * MemAvailable minus the not-yet-used part of the running jobs' memory leaves the job's memory plus a margin (3 GB),
   * (GPU jobs) the GPU has that much free memory,
   * no high-priority job is waiting (high-priority jobs go first; normal jobs backfill only when none is blocked).
@@ -51,7 +52,8 @@ Q = Path(os.environ.get("JOBQ_DIR", Path(__file__).resolve().parent))
 PROJECTS = Path(os.environ.get("JOBQ_PROJECTS_ROOT", Q.parent))
 PENDING, RUNNING, DONE, LOGS = Q / "pending", Q / "running", Q / "done", Q / "logs"
 BIG_GB = 50.0          # RAM cap of a single job (whatever it declared); beyond it the job pages to swap
-THREAD_BUDGET = int(1.5 * os.cpu_count())   # declared threads of running jobs (jobs often declare more than they use)
+CPUS = sorted(os.sched_getaffinity(0))   # CPUs jobs may use: the daemon's affinity, inherited by every job
+THREAD_BUDGET = int(1.5 * len(CPUS))   # declared threads of running jobs (jobs often declare more than they use)
 MARGIN_GB = 3.0        # RAM always left free for the OS and the other users
 STALL_RAM_GB = 1.0     # a stalled job is killed only if it holds at least this much RAM
 OVERBOOK = 0.5        # a running job reserves its real RAM use plus this share of the rest of its declaration
@@ -113,6 +115,18 @@ def alive(pid) -> bool:
         return False
 
 
+def cpu_ranges(cpus: list[int]) -> str:
+    """[1, 2, 3, 5] -> '1-3,5'"""
+    out, i = [], 0
+    while i < len(cpus):
+        k = i
+        while k + 1 < len(cpus) and cpus[k + 1] == cpus[k] + 1:
+            k += 1
+        out.append(f"{cpus[i]}-{cpus[k]}" if k > i else str(cpus[i]))
+        i = k + 1
+    return ",".join(out)
+
+
 def system_usage() -> dict:
     """Whole machine, all users: busy cores (0.5 s sample), RAM, swap and GPU memory in use."""
     def ticks():
@@ -126,7 +140,7 @@ def system_usage() -> dict:
         gpu = (float(g[0]) / 1024, float(g[1]) / 1024)
     except Exception:
         gpu = (0.0, 0.0)
-    return {"cores_busy": round(os.cpu_count() * (1 - (i1 - i0) / max(1, t1 - t0)), 1), "cores": os.cpu_count(),
+    return {"cores_busy": round(os.cpu_count() * (1 - (i1 - i0) / max(1, t1 - t0)), 1), "cores": len(CPUS),
             "ram_used_gb": round(m["MemTotal"] - m["MemAvailable"], 1), "ram_total_gb": round(m["MemTotal"]),
             "swap_used_gb": round(m["SwapTotal"] - m["SwapFree"], 1), "swap_total_gb": round(m["SwapTotal"]),
             "gpu_used_gb": round(gpu[0], 1), "gpu_total_gb": round(gpu[1])}
@@ -325,7 +339,7 @@ def status_dict(n_done: int) -> dict:
                                    "peak_swap_gb", "killed")} | {"id": f.stem} for f, j in sorted(jobs(DONE), key=lambda fj: fj[1].get("ended") or "")[-n_done:][::-1]]
     up = alive(st.get("pid")) and time.time() - st.get("heartbeat", 0) < 120
     return {"daemon": "up" if up else "DOWN", "paused": (Q / "PAUSE").exists(), "cgroups": st.get("cgroups"),
-            "threads_budget": st.get("budget"), "threads_used": sum(r["threads"] for r in running),
+            "threads_budget": st.get("budget"), "cpus": st.get("cpus"), "threads_used": sum(r["threads"] for r in running),
             "mem_available_gb": round(mem_available_gb(), 1), "gpu_free_mb": gpu_free_mb(), "system": system_usage(),
             "running": running, "pending": pending, "done": done, "idle_hogs": st.get("hogs", [])}
 
@@ -373,9 +387,14 @@ def render_md(s: dict) -> str:
     L = ["# Job queue", "",
          f"Updated {now()} (every 30 s)  ",
          f"Daemon {s['daemon']}{', PAUSED (no new starts)' if s['paused'] else ''} | threads {s['threads_used']}/"
-         f"{s['threads_budget']} | free RAM {s['mem_available_gb']} GB | free GPU {s['gpu_free_mb'] / 1024:.1f} GB", "",
-         f"## Running ({len(s['running'])})", ""]
+         f"{s['threads_budget']} | free RAM {s['mem_available_gb']} GB | free GPU {s['gpu_free_mb'] / 1024:.1f} GB"
+         + (f" | jobs on CPUs {s['cpus']} of 0-{os.cpu_count() - 1}" if s.get("cpus") not in (None, f"0-{os.cpu_count() - 1}")
+            else ""), ""]
     u = s["system"]
+    if not u["swap_total_gb"]:
+        L += ["**WARNING: the machine has no swap.** Frozen jobs stay in RAM, and a job above its RAM cap is killed "
+              "instead of paging.", ""]
+    L += [f"## Running ({len(s['running'])})", ""]
     rows = [["SYSTEM", "", f"{u['cores_busy']:.0f}/{u['cores']}C + G {u['gpu_used_gb']:.1f}/{u['gpu_total_gb']}",
              f"{sum(r['mem'] for r in s['running']):.1f}", f"{u['ram_used_gb']:.1f}/{u['ram_total_gb']}",
              f"{u['swap_used_gb']:.1f}/{u['swap_total_gb']}", ""]]
@@ -617,7 +636,8 @@ def cmd_daemon(a):
         sys.exit(f"daemon already running (pid {old})")
     cg_setup(log)
     budget = a.budget or THREAD_BUDGET
-    log.write(f"{now()} daemon start pid {os.getpid()} budget {budget} threads, margin {a.margin} GB\n")
+    log.write(f"{now()} daemon start pid {os.getpid()} budget {budget} threads, margin {a.margin} GB, "
+              f"CPUs {cpu_ranges(CPUS)}\n")
     procs: dict[str, subprocess.Popen] = {}
     progress: dict[str, tuple[float, float]] = {}   # job id -> (CPU seconds, time CPU last advanced)
     seen_hogs: dict[int, tuple] = {}
@@ -806,7 +826,7 @@ def cmd_daemon(a):
         if tick % 10 == 0:
             hogs = scan_hogs(seen_hogs)
         tick += 1
-        save(Q / "state.json", {"pid": os.getpid(), "heartbeat": time.time(), "budget": budget,
+        save(Q / "state.json", {"pid": os.getpid(), "heartbeat": time.time(), "budget": budget, "cpus": cpu_ranges(CPUS),
                                 "cgroups": CG_ROOT is not None, "waiting": waiting, "hogs": hogs})
         try:
             tmp = Q / "QUEUE.md.tmp"
