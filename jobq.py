@@ -5,8 +5,10 @@ State lives next to this file (or in $JOBQ_DIR); AGENTS.md is the guide for the 
 
 Every job declares the threads it uses, the peak memory it may need and (optionally) the GPU memory. The daemon starts a
 pending job only when
-  * the threads of the running jobs plus the job's threads stay within the budget (default 1.5 x the CPUs the daemon
-    may use; jobs inherit its CPU affinity),
+  * the cores reserved by the running jobs plus the job's threads stay within the budget (default 1.5 x the CPUs the
+    daemon may use; jobs inherit its CPU affinity). A running job reserves its declared threads for its first 5 min
+    (and 5 min after a resume), afterwards the cores it actually uses (5 min average); its cgroup's cpu.weight is its
+    declared threads, so under contention jobs share the cores in proportion to their declarations,
   * MemAvailable minus the not-yet-used part of the running jobs' memory leaves the job's memory plus a margin (3 GB),
   * (GPU jobs) the GPU has that much free memory,
   * no high-priority job is waiting (high-priority jobs go first; normal jobs backfill only when none is blocked).
@@ -60,6 +62,7 @@ OVERBOOK = 0.5        # a running job reserves its real RAM use plus this share 
 FREEZE_BELOW_GB = 5.0  # free RAM below this: freeze the newest CPU job and push it to swap
 GROWER_GB = 20.0       # freeze first: the fastest grower holding more than this, else a job this far over its declaration
 STARVE_MIN = 30       # a job waiting this long for RAM/threads stops later jobs from starting ahead of it
+RAMP_MIN = 5          # a job reserves its declared threads this long after a start or resume, then the cores it uses
 HOG_RAM_GB, HOG_IDLE_MIN = 2.0, 30   # report idle processes outside the queue above this RAM
 SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL", re.I)
 
@@ -251,13 +254,17 @@ def cg_setup(log):
             except OSError:
                 pass
         (base / "cgroup.subtree_control").write_text("+memory +pids")
+        try:
+            (base / "cgroup.subtree_control").write_text("+cpu")
+        except OSError as e:
+            log.write(f"{now()} no cpu controller for job cgroups (no per-job cpu.weight): {e}\n")
         CG_ROOT = base
         log.write(f"{now()} per-job cgroups under {base}\n")
     except Exception as e:
         log.write(f"{now()} no per-job cgroups: {e}\n")
 
 
-def cg_job(stem: str, ram_gb: float):
+def cg_job(stem: str, ram_gb: float, threads: int = 1):
     if CG_ROOT is None:
         return None
     cg = CG_ROOT / f"job-{stem}"
@@ -265,9 +272,18 @@ def cg_job(stem: str, ram_gb: float):
         cg.mkdir(exist_ok=True)
         (cg / "memory.max").write_text(str(int(ram_gb * 1024 ** 3)))
         (cg / "memory.swap.max").write_text("max")
+        cg_weight(cg, threads)
         return cg
     except Exception:
         return None
+
+
+def cg_weight(cg, threads: int):
+    """CPU share under contention in proportion to the declared threads (1 thread = the default weight 100)."""
+    try:
+        (Path(cg) / "cpu.weight").write_text(str(max(1, min(10000, threads * 100))))
+    except OSError:
+        pass
 
 
 def cg_kill(cg) -> int:
@@ -327,6 +343,7 @@ def status_dict(n_done: int) -> dict:
         ram, swap, _ = job_usage(j)
         running.append({k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "pid", "started",
                                               "log", "stalled_since", "frozen", "time_h", "early", "shown_gb")} | {"id": f.stem, "ram_gb": round(ram, 2),
+                                                                         "cores": st.get("reserved", {}).get(f.stem),
                                                                          "swap_gb": round(swap, 2), "ram_cap_gb": ram_limit(j)})
     # frozen jobs head the waiting list (oldest first): they wait to resume
     frozen = sorted([(f, j | {"added": j["frozen"]}) for f, j in jobs(RUNNING) if j.get("frozen")],
@@ -334,12 +351,13 @@ def status_dict(n_done: int) -> dict:
     pending = [{k: j.get(k) for k in ("name", "project", "threads", "mem", "gpu", "high", "added", "time_h", "frozen",
                                       "shown_gb")}
                | ({"swap_gb": round(job_usage(j)[1], 2)} if j.get("frozen") else {}) | {"id": f.stem, "waiting_for": st.get("waiting", {}).get(f.stem, "next daemon pass")}
-               for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"), fj[0].name))]
+               for f, j in frozen + sorted(jobs(PENDING), key=lambda fj: (not fj[1].get("high"),
+                   "(waiting longer)" in st.get("waiting", {}).get(fj[0].stem, ""), fj[0].name))]
     done = [{k: j.get(k) for k in ("name", "project", "rc", "started", "ended", "log", "mem", "peak_ram_gb",
                                    "peak_swap_gb", "killed")} | {"id": f.stem} for f, j in sorted(jobs(DONE), key=lambda fj: fj[1].get("ended") or "")[-n_done:][::-1]]
     up = alive(st.get("pid")) and time.time() - st.get("heartbeat", 0) < 120
     return {"daemon": "up" if up else "DOWN", "paused": (Q / "PAUSE").exists(), "cgroups": st.get("cgroups"),
-            "threads_budget": st.get("budget"), "cpus": st.get("cpus"), "threads_used": sum(r["threads"] for r in running),
+            "threads_budget": st.get("budget"), "cpus": st.get("cpus"), "threads_used": round(sum(r["cores"] or r["threads"] for r in running), 1),
             "mem_available_gb": round(mem_available_gb(), 1), "gpu_free_mb": gpu_free_mb(), "system": system_usage(),
             "running": running, "pending": pending, "done": done, "idle_hogs": st.get("hogs", [])}
 
@@ -396,16 +414,17 @@ def render_md(s: dict) -> str:
               "instead of paging.", ""]
     L += [f"## Running ({len(s['running'])})", ""]
     rows = [["SYSTEM", "", f"{u['cores_busy']:.0f}/{u['cores']}C + G {u['gpu_used_gb']:.1f}/{u['gpu_total_gb']}",
-             f"{sum(r['mem'] for r in s['running']):.1f}", f"{u['ram_used_gb']:.1f}/{u['ram_total_gb']}",
+             f"{s['threads_used']:.1f}", f"{sum(r['mem'] for r in s['running']):.1f}", f"{u['ram_used_gb']:.1f}/{u['ram_total_gb']}",
              f"{u['swap_used_gb']:.1f}/{u['swap_total_gb']}", ""]]
     for r in sorted(s["running"], key=lambda r: r["started"] or ""):
         flag = (" HIGH" if r.get("high") else "") + (" STALLED" if r.get("stalled_since") else "") + \
                (" (early)" if r.get("early") else "")
         rows.append([f"{r['project']}/{r['name']}{flag}", since(r["started"]), cg_text(r),
-                     f"{r['mem']:.1f}", f"{r['ram_gb']:.1f}", f"{r['swap_gb']:.1f}", dur(r.get("time_h"))])
-    L += table(["Job", "For", "CPU/GPU", "Decl GB", "RAM GB", "Swap GB", "Decl time"], rows, "lllrrrr")
-    L += ["", "Decl time: the job's --time estimate (- = none). (early) = started ahead of a waiting job because it is "
-          "expected to end before that job's reserved start."]
+                     num(r.get("cores")), f"{r['mem']:.1f}", f"{r['ram_gb']:.1f}", f"{r['swap_gb']:.1f}", dur(r.get("time_h"))])
+    L += table(["Job", "For", "CPU/GPU", "Cores", "Decl GB", "RAM GB", "Swap GB", "Decl time"], rows, "lllrrrrr")
+    L += ["", "Cores: what the job reserves of the thread budget: its declared threads for its first 5 min, then the cores "
+          "it uses. Decl time: the job's --time estimate (- = none). (early) = started ahead of a waiting job because "
+          "it is expected to end before that job's reserved start."]
     L += ["", f"## Next up ({len(s['pending'])}, in start order)", ""]
     if s["pending"]:
         rows = [[i, f"{p['project']}/{p['name']}", "FROZEN" if p.get("frozen") else "HIGH" if p["high"] else "",
@@ -461,7 +480,8 @@ def cmd_status(a):
           f"per-job cgroups {'yes' if s['cgroups'] else 'NO'}")
     for r in s["running"]:
         stall = f"  STALLED since {r['stalled_since']}" if r.get("stalled_since") else ""
-        print(f"RUNNING  {r['project'] + '/' + r['name']:45s} thr {r['threads']:2d} mem {r['mem']:5.1f} GB  "
+        print(f"RUNNING  {r['project'] + '/' + r['name']:45s} thr {r['threads']:2d} ({num(r.get('cores'))} used) "
+              f"mem {r['mem']:5.1f} GB  "
               f"now {r['ram_gb']:5.1f} GB + swap {r['swap_gb']:5.1f} GB  since {r['started']}{stall}")
     for p in s["pending"]:
         print(f"{'FROZEN  ' if p.get('frozen') else 'PENDING*' if p['high'] else 'PENDING '} "
@@ -642,12 +662,14 @@ def cmd_daemon(a):
     progress: dict[str, tuple[float, float]] = {}   # job id -> (CPU seconds, time CPU last advanced)
     seen_hogs: dict[int, tuple] = {}
     guard: dict = {}
-    for _, j in jobs(RUNNING):      # running jobs get the current RAM cap
+    for _, j in jobs(RUNNING):      # running jobs get the current RAM cap and CPU weight
         if j.get("cgroup") and Path(j["cgroup"]).is_dir():
             try:
                 Path(j["cgroup"], "memory.max").write_text(str(int(ram_limit(j) * 1024 ** 3)))
             except OSError:
                 pass
+            cg_weight(j["cgroup"], j["threads"])
+    cpu_hist: dict[str, list[tuple[float, float]]] = {}   # job id -> [(time, CPU seconds)] over the last RAMP_MIN
     hogs: list[dict] = []
     last_gpu_start, tick = 0.0, 0
     while True:
@@ -693,8 +715,29 @@ def cmd_daemon(a):
                     pass
         running = jobs(RUNNING)
         sweep_cgroups({j.get("cgroup") for _, j in running if j.get("cgroup")})
-        threads = sum(j["threads"] for _, j in running if not j.get("frozen"))   # a frozen job uses no CPU
         usage = {f.stem: job_usage(j) for f, j in running}
+        t_now = time.time()
+        for f, j in running:
+            h = cpu_hist.setdefault(f.stem, [])
+            h.append((t_now, usage[f.stem][2]))
+            while len(h) > 1 and t_now - h[0][0] > 60 * RAMP_MIN:
+                h.pop(0)
+        for k in set(cpu_hist) - {f.stem for f, _ in running}:
+            del cpu_hist[k]
+
+        def cores(f, j) -> float:
+            """Cores a running job reserves: its declared threads for RAMP_MIN after its start or last resume, then
+            the cores it used over the last RAMP_MIN (since the start if the daemon has less history)."""
+            if j.get("frozen"):
+                return 0.0
+            since = max(ts(j["started"]), ts(j["resumed"]) if j.get("resumed") else 0.0)
+            if t_now - since < 60 * RAMP_MIN:
+                return float(j["threads"])
+            h = cpu_hist[f.stem]
+            t0, c0 = h[0] if t_now - h[0][0] > 60 else (since, 0.0)
+            return round(max(0.0, (usage[f.stem][2] - c0) / max(1.0, t_now - t0)), 1)
+        reserved = {f.stem: cores(f, j) for f, j in running}
+        threads = sum(reserved.values())
         for f, j in running:     # a frozen job has shown that it needs at least its RAM + swap
             ram, swap, _ = usage[f.stem]
             if j.get("frozen") and ram + swap > j.get("shown_gb", 0) + 0.1:
@@ -734,9 +777,10 @@ def cmd_daemon(a):
                     and empty_queue_free >= OVERBOOK * charge(j) + a.margin)
         # (expected end, RAM given back at the end, spare_of) of each running job, for the blocked urgent job's reserved
         # start; a job started in a blocker's spare RAM does not count as giving RAM back to that blocker
-        releases = [(end_ts(j), reserve(j, u), j.get("spare_of")) for j, u in live]
+        releases = [(end_ts(j), reserve(j, u), reserved[f.stem], j.get("spare_of")) for f, j in running if not j.get("frozen")
+                    for u in [usage[f.stem][0]]]
         waiting, blocker = {}, None
-        shadow, spare = None, 0.0     # reserved start of the blocker (None: no backfill), RAM still spare at that time
+        shadow, spare, spare_thr = None, 0.0, 0.0   # blocker's reserved start (None: no backfill), RAM / cores spare then
         paused = (Q / "PAUSE").exists()
         # frozen jobs first (oldest first): they are waiting jobs whose size is known
         frozen = sorted([(f, j) for f, j in running if j.get("frozen")], key=lambda fj: fj[1].get("started") or "")
@@ -747,10 +791,10 @@ def cmd_daemon(a):
                 why = "PAUSE file"
             elif blocker and not (shadow is not None and (not fz and j.get("time_h")
                                                          and time.time() + 3600 * j["time_h"] <= shadow
-                                                         or took <= spare)):
+                                                         or took <= spare and j["threads"] <= spare_thr)):
                 why = f"{blocker} (waiting longer)"
             elif threads + j["threads"] > budget and threads > 0:
-                why = f"threads ({threads} of {budget} in use)"
+                why = f"threads ({threads:.1f} of {budget} cores reserved)"
             elif fz and time.time() - ts(j["frozen"]) < 60:
                 why = "just frozen"
             elif avail < need(f, j):
@@ -762,24 +806,24 @@ def cmd_daemon(a):
                 waiting[f.stem] = why
                 if (fz or not paused) and not blocker and urgent(j) and why.startswith(("memory", "threads")):
                     blocker = f"{j['project']}/{j['name']}"
-                    if why.startswith("memory"):   # reserve its start: the first time enough running jobs have ended
-                        free_then, shadow = avail, float("inf")
-                        for e, back, of in sorted(releases, key=lambda r: r[:2]):
-                            if of == blocker:
-                                continue
-                            free_then += back
-                            if free_then >= need(f, j):
-                                shadow, spare = e, free_then - need(f, j)
-                                break
-                        why += ("; reserved start ~" + time.strftime("%m-%d %H:%M", time.localtime(shadow))
-                                if shadow < float("inf") else "; start time unknown (running jobs without --time)")
-                        waiting[f.stem] = why
+                    # reserve its start: the first time enough running jobs have ended for both its RAM and its threads
+                    free_then, thr_then, shadow = avail, budget - threads, float("inf")
+                    for e, back, back_thr, of in sorted(releases, key=lambda r: r[:2]):
+                        if of == blocker:
+                            continue
+                        free_then += back; thr_then += back_thr
+                        if free_then >= need(f, j) and thr_then >= j["threads"]:
+                            shadow, spare, spare_thr = e, free_then - need(f, j), thr_then - j["threads"]
+                            break
+                    why += ("; reserved start ~" + time.strftime("%m-%d %H:%M", time.localtime(shadow))
+                            if shadow < float("inf") else "; start time unknown (running jobs without --time)")
+                    waiting[f.stem] = why
                 continue
             if blocker:
                 if not fz and j.get("time_h") and time.time() + 3600 * j["time_h"] <= shadow:
                     j["early"] = blocker
                 else:
-                    spare -= took
+                    spare -= took; spare_thr -= j["threads"]
                     j["spare_of"] = blocker
             if fz:
                 try:
@@ -787,8 +831,9 @@ def cmd_daemon(a):
                 except OSError as e:
                     log.write(f"{now()} cannot thaw {j['name']}: {e}\n")
                 j["frozen_min"] = j.get("frozen_min", 0) + int((time.time() - ts(j["frozen"])) / 60)
-                j.pop("frozen"); save(f, j)
-                threads += j["threads"]; avail -= took; releases.append((end_ts(j), reserve(j, usage[f.stem][0]), j.get("spare_of")))
+                j.pop("frozen"); j["resumed"] = now(); save(f, j)
+                threads += j["threads"]; avail -= took
+                releases.append((end_ts(j), reserve(j, usage[f.stem][0]), float(j["threads"]), j.get("spare_of")))
                 log.write(f"{now()} resumed {j['project']}/{j['name']} (shown size {j['shown_gb']:.1f} GB, "
                           f"free {avail + took:.1f} GB)\n")
                 continue
@@ -801,7 +846,7 @@ def cmd_daemon(a):
             env["JOBQ_ID"] = f.stem
             inner = j["cmd"][0] if len(j["cmd"]) == 1 else shlex.join(j["cmd"])
             logf, rcf = LOGS / f"{f.stem}.log", LOGS / f"{f.stem}.rc"
-            cg = cg_job(f.stem, ram_limit(j))
+            cg = cg_job(f.stem, ram_limit(j), j["threads"])
             if cg is not None:
                 pre = f"echo $$ > {cg}/cgroup.procs; "
             elif j["gpu"] <= 0:
@@ -820,13 +865,14 @@ def cmd_daemon(a):
             j |= {"pid": p.pid, "started": now(), "log": str(logf), "cgroup": str(cg) if cg else None}
             save(RUNNING / f.name, j); f.unlink(); procs[f.stem] = p
             threads += j["threads"]; avail -= OVERBOOK * charge(j)
-            releases.append((end_ts(j), OVERBOOK * charge(j), j.get("spare_of")))
+            releases.append((end_ts(j), OVERBOOK * charge(j), float(j["threads"]), j.get("spare_of")))
             log.write(f"{now()} start {j['project']}/{j['name']} pid {p.pid} thr {j['threads']} mem {j['mem']} "
                       f"cap {ram_limit(j):.1f} GB (free {avail + OVERBOOK * charge(j):.1f} GB, threads now {threads})\n")
         if tick % 10 == 0:
             hogs = scan_hogs(seen_hogs)
         tick += 1
         save(Q / "state.json", {"pid": os.getpid(), "heartbeat": time.time(), "budget": budget, "cpus": cpu_ranges(CPUS),
+                                "reserved": reserved,
                                 "cgroups": CG_ROOT is not None, "waiting": waiting, "hogs": hogs})
         try:
             tmp = Q / "QUEUE.md.tmp"

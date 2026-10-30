@@ -13,9 +13,11 @@ There is no server, database or scheduler to set up: the queue is a directory of
 
 ## What it does
 
-- **RAM-aware admission with overbooking.** Each job declares threads, peak RAM and optional GPU memory. Agents can't
-  predict memory well and usually over-declare, so a running job reserves its *real* use plus half of the rest of
-  its declaration, and a new job needs half of its declaration plus a 3 GB margin free.
+- **Admission by measurement, not by declaration.** Each job declares threads, peak RAM and optional GPU memory.
+  Agents can't predict either well and usually over-declare, so a running job reserves its *real* RAM use plus half
+  of the rest of its declaration (a new job needs half of its declaration plus a 3 GB margin free), and reserves its
+  declared threads only for its first 5 minutes, afterwards the cores it actually uses. Under CPU contention each
+  job's cgroup `cpu.weight` is its declared threads, so declarations act as CPU priority rather than as a gate.
 - **Memory guard instead of the OOM killer.** Every 5 s: if free RAM drops below 5 GB, a CPU job is **frozen**
   (cgroup v2 freezer) and its memory pushed to swap (`memory.reclaim`): the fastest grower if it holds more than
   20 GB, else a job more than 20 GB over its declaration, else the newest job. The frozen job then heads the waiting list with the size it has shown (RAM + swap,
@@ -98,7 +100,8 @@ Constants at the top of `jobq.py`:
 | Constant | Default | Meaning |
 |---|---|---|
 | `BIG_GB` | 50 | RAM cap of one job; beyond it the job pages to swap |
-| `THREAD_BUDGET` | 1.5 × usable CPUs | sum of declared threads of running jobs (usable = the daemon's CPU affinity) |
+| `THREAD_BUDGET` | 1.5 × usable CPUs | cores reserved by running jobs (usable = the daemon's CPU affinity) |
+| `RAMP_MIN` | 5 | minutes a job reserves its declared threads after a start or resume, before its measured use counts |
 | `MARGIN_GB` | 3 | RAM always left free |
 | `OVERBOOK` | 0.5 | share of a job's unused declaration that is reserved |
 | `FREEZE_BELOW_GB` | 5 | free RAM below which the memory guard freezes a job |

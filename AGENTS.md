@@ -17,7 +17,10 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
 - `--name`: letters, digits, `_ . + -`. Make it unique within your project (e.g. `train_shd_s1`).
 - `--threads`: how many cores the job really uses. The job gets `OMP_NUM_THREADS`, `MKL_NUM_THREADS` and
   `OPENBLAS_NUM_THREADS` set to it, plus `JOBQ_THREADS`; pass that value to tools that take their own thread option
-  (`NUM_CORES`, `-j`, `torch.set_num_threads`, ...).
+  (`NUM_CORES`, `-j`, `torch.set_num_threads`, ...). The queue counts cores by use, not by declaration: a running
+  job reserves its declared threads for its first 5 min, afterwards the cores it actually uses (5 min average), so
+  over-declaring costs others nothing for long. Under CPU contention jobs share the cores in proportion to their
+  declared threads (cgroup `cpu.weight`), so the declaration is also the job's CPU priority.
 - `--mem`: your best estimate of peak RAM in GB. Nobody can predict it exactly, so the queue protects itself:
   - A job starts when half its declaration + 3 GB fits in free RAM, where each running job reserves its real use
     plus half of the rest of its declaration.
@@ -30,8 +33,8 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
 - `--gpu`: GPU memory in MB. GPU jobs start at least 3 min apart and only if the GPU has that much free.
 - Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill). A frozen or HIGH job, or a job that has
   waited 30 min for RAM or threads, gets a **reserved start**: the time enough running jobs are expected to have
-  ended (from their `--time`). Later jobs may then start ahead of it only if their `--time` ends before that
-  reserved start, or if it would still fit with them running. A job without `--time` can't start this way.
+  ended (from their `--time`) for both its RAM and its threads. Later jobs may then start ahead of it only if their
+  `--time` ends before that reserved start, or if it would still fit (RAM and threads) with them running. A job without `--time` can't start this way.
   Running jobs without `--time` count as never ending.
 - `--high`: high priority. It starts before every normal job, and normal jobs don't start while a high one waits.
   Use it only when the user asked for it.
