@@ -22,8 +22,9 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
   over-declaring costs others nothing for long. Under CPU contention jobs share the cores in proportion to their
   declared threads (cgroup `cpu.weight`), so the declaration is also the job's CPU priority.
 - `--mem`: your best estimate of peak RAM in GB. Nobody can predict it exactly, so the queue protects itself:
-  - A job starts when half its declaration + 3 GB fits in free RAM, where each running job reserves its real use
-    plus half of the rest of its declaration.
+  - A job starts when its declaration + 3 GB fits in free RAM. It reserves its declaration for its first 5 min
+    (and 5 min after a resume), afterwards only the RAM it actually uses, so an over-declared job stops blocking
+    others after 5 min, and a job that grows late may find the RAM taken (then the memory guard pauses it, below).
   - Any job may use up to 50 GB of RAM (whatever it declared); beyond that it pages to swap.
   - If free RAM still drops below 5 GB, the memory guard steps in (below). Your job may be paused, never OOM-killed.
   For a GPU job, `--mem` is the host (CPU) RAM only; GPU memory goes in `--gpu`.
@@ -34,7 +35,9 @@ jobq add --name <short_name> --threads <T> --mem <peak GB> --time <30m|6h|2d> [-
 - Waiting: smaller jobs may start ahead of a bigger one when they fit (backfill). A frozen or HIGH job, or a job that has
   waited 30 min for RAM or threads, gets a **reserved start**: the time enough running jobs are expected to have
   ended (from their `--time`) for both its RAM and its threads. Later jobs may then start ahead of it only if their
-  `--time` ends before that reserved start, or if it would still fit (RAM and threads) with them running. A job without `--time` can't start this way.
+  `--time` ends before that reserved start, or is at most max(2 h, 20 % of the waiting job's `--time`), or if it would
+  still fit (RAM and threads) with them running. So short jobs never wait long behind a big one, and a big job is
+  delayed by them by at most 20 % of its own run time. A job without `--time` can't start this way.
   Running jobs without `--time` count as never ending.
 - `--high`: high priority. It starts before every normal job, and normal jobs don't start while a high one waits.
   Use it only when the user asked for it.

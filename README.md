@@ -14,9 +14,9 @@ There is no server, database or scheduler to set up: the queue is a directory of
 ## What it does
 
 - **Admission by measurement, not by declaration.** Each job declares threads, peak RAM and optional GPU memory.
-  Agents can't predict either well and usually over-declare, so a running job reserves its *real* RAM use plus half
-  of the rest of its declaration (a new job needs half of its declaration plus a 3 GB margin free), and reserves its
-  declared threads only for its first 5 minutes, afterwards the cores it actually uses. Under CPU contention each
+  Agents can't predict either well and usually over-declare, so a running job reserves its declared RAM and threads
+  only for its first 5 minutes, afterwards what it actually uses (a new job needs its declaration plus a 3 GB margin
+  free). Under CPU contention each
   job's cgroup `cpu.weight` is its declared threads, so declarations act as CPU priority rather than as a gate.
 - **Memory guard instead of the OOM killer.** Every 5 s: if free RAM drops below 5 GB, a CPU job is **frozen**
   (cgroup v2 freezer) and its memory pushed to swap (`memory.reclaim`): the fastest grower if it holds more than
@@ -31,8 +31,9 @@ There is no server, database or scheduler to set up: the queue is a directory of
   everyone else.
 - **Fair ordering with time estimates.** FIFO with backfill (small jobs start while a big one waits). A job that has
   waited 30 min gets a reserved start: when enough running jobs are expected to end, from their `--time` estimates.
-  Later jobs may start ahead of it only if they end before that time or leave it enough RAM (EASY backfill), so
-  big jobs don't starve and short jobs don't sit behind a multi-day run. `--high` jumps the queue.
+  Later jobs may start ahead of it only if they end before that time, are short (at most max(2 h, 20 % of the big
+  job's `--time`)), or leave it enough RAM and cores (EASY backfill), so big jobs don't starve and short jobs don't
+  sit behind a multi-day run. `--high` jumps the queue.
 - **Watchdog.** Kills processes a finished job left behind, kills jobs that hold RAM but have used no CPU for an hour
   (configurable per job), and reports idle processes outside the queue that hold more than 2 GB.
 - **Live view.** The daemon rewrites `QUEUE.md` every 30 s: a whole-machine usage row, running jobs (CPU/GPU, declared
@@ -101,9 +102,9 @@ Constants at the top of `jobq.py`:
 |---|---|---|
 | `BIG_GB` | 50 | RAM cap of one job; beyond it the job pages to swap |
 | `THREAD_BUDGET` | 1.5 × usable CPUs | cores reserved by running jobs (usable = the daemon's CPU affinity) |
-| `RAMP_MIN` | 5 | minutes a job reserves its declared threads after a start or resume, before its measured use counts |
+| `RAMP_MIN` | 5 | minutes a job reserves its declared threads and RAM after a start or resume, before its measured use counts |
+| `SHORT_H` / `SHORT_SHARE` | 2 / 0.2 | jobs up to max(SHORT_H, SHORT_SHARE × its `--time`) may start ahead of a waiting big job |
 | `MARGIN_GB` | 3 | RAM always left free |
-| `OVERBOOK` | 0.5 | share of a job's unused declaration that is reserved |
 | `FREEZE_BELOW_GB` | 5 | free RAM below which the memory guard freezes a job |
 | `STARVE_MIN` | 30 | minutes before a waiting job gets a reserved start |
 | `GROWER_GB` | 20 | frozen first: a fast grower holding more than this, else a job this far over its declaration |
